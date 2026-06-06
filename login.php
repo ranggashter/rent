@@ -308,9 +308,6 @@ html, body {
         </button>
       </form>
 
-      <div class="login-footer">
-        Demo: admin/admin atau user/user
-      </div>
     </div>
   </div>
 </div>

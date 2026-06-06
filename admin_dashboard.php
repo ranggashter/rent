@@ -44,9 +44,60 @@ if($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     if($action === 'hapus_mobil') {
         $id = (int)$_POST['id_mobil'];
-        $conn->query("DELETE FROM mobil WHERE id_mobil=$id");
-        $msg = 'Mobil berhasil dihapus!';
+
+        // Hapus hanya jika semua penyewaan terkait sudah berstatus 'dikembalikan'.
+        // (FK akan mencegah delete jika masih ada status selain 'dikembalikan', termasuk NULL/'').
+        $stmt = $conn->prepare(
+            "SELECT COUNT(*) AS c " .
+            "FROM penyewaan " .
+            "WHERE id_mobil=? " .
+            "AND status <> 'dikembalikan'"
+        );
+
+        $stmt->bind_param("i", $id);
+        $stmt->execute();
+        $cnt = (int)($stmt->get_result()->fetch_assoc()['c'] ?? 0);
+
+        if($cnt > 0) {
+            $msg = 'Mobil tidak bisa dihapus karena masih ada penyewaan yang belum dikembalikan.';
+        } else {
+            $stmt2 = $conn->prepare("DELETE FROM mobil WHERE id_mobil=?");
+            $stmt2->bind_param("i", $id);
+            try {
+                // Validasi ulang di dalam transaction
+                // agar jika ada perubahan data di tengah proses, delete akan dibatalkan.
+                $conn->begin_transaction();
+
+                $chk = $conn->prepare(
+                    "SELECT COUNT(*) AS c FROM penyewaan WHERE id_mobil=? AND status <> 'dikembalikan'"
+                );
+                $chk->bind_param("i", $id);
+                $chk->execute();
+                $chkCnt = (int)($chk->get_result()->fetch_assoc()['c'] ?? 0);
+
+                if($chkCnt > 0) {
+                    $conn->rollback();
+                    $msg = 'Mobil tidak bisa dihapus karena masih ada penyewaan yang belum dikembalikan.';
+                } else {
+                    $stmt2->execute();
+                    $conn->commit();
+
+                    if($stmt2->affected_rows > 0) {
+                        $msg = 'Mobil berhasil dihapus!';
+                    } else {
+                        $msg = 'Mobil tidak terhapus (data mobil tidak ditemukan).';
+                    }
+                }
+            } catch (mysqli_sql_exception $e) {
+                try { $conn->rollback(); } catch (Throwable $t) {}
+                $msg = 'Gagal menghapus mobil: ' . $e->getMessage();
+            }
+
+        }
+
     }
+
+
 
     if($action === 'setujui_sewa') {
         $id_sewa = (int)$_POST['id_sewa'];
@@ -374,8 +425,10 @@ tr:last-child td{border-bottom:none}
   <div id="tab-laporan" style="display:none">
     <div class="section">
       <div class="sec-header">
-        <div class="sec-title">📊 Laporan Penyewaan per Tanggal</div>
+        <div class="sec-title">📊 Laporan (Grafik) + Penyewaan</div>
       </div>
+
+      <!-- FILTER (existing) -->
       <form method="GET" style="padding:18px 22px;display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
         <div class="field" style="margin:0">
           <label>Dari Tanggal</label>
@@ -388,6 +441,23 @@ tr:last-child td{border-bottom:none}
         <input type="hidden" name="tab" value="laporan">
         <button type="submit" class="btn-sm">Tampilkan</button>
       </form>
+
+      <!-- CHARTS -->
+<div style="padding:18px 22px;display:grid;grid-template-columns:1fr 1fr;gap:18px">
+        <div style="background:rgba(255,255,255,.02);border:1px solid var(--border);border-radius:12px;padding:14px">
+          <div style="font-size:.85rem;font-weight:600;letter-spacing:.3px;margin-bottom:8px">Pendapatan (12 bulan terakhir)</div>
+          <div style="position:relative; width:100%; height:140px;"><canvas id="chartPendapatan"></canvas></div>
+        </div>
+        <div style="background:rgba(255,255,255,.02);border:1px solid var(--border);border-radius:12px;padding:14px">
+          <div style="font-size:.85rem;font-weight:600;letter-spacing:.3px;margin-bottom:8px">Total Denda (12 bulan terakhir)</div>
+          <div style="position:relative; width:100%; height:140px;"><canvas id="chartDenda"></canvas></div>
+        </div>
+        <div style="grid-column:1 / -1;background:rgba(255,255,255,.02);border:1px solid var(--border);border-radius:12px;padding:14px">
+          <div style="font-size:.85rem;font-weight:600;letter-spacing:.3px;margin-bottom:8px">Jumlah Transaksi per Status (12 bulan terakhir)</div>
+          <div style="position:relative; width:100%; height:120px;"><canvas id="chartStatus"></canvas></div>
+        </div>
+      </div>
+
       <div class="tbl-wrap">
         <table>
           <thead><tr>
@@ -438,6 +508,7 @@ tr:last-child td{border-bottom:none}
 
 <!-- MODAL TAMBAH -->
 <div class="modal-bg" id="modal-tambah">
+
   <div class="modal">
     <h3>Tambah Mobil</h3>
     <form method="POST" enctype="multipart/form-data">
@@ -485,6 +556,7 @@ tr:last-child td{border-bottom:none}
 <div class="toast" id="toast"><?= $msg ?></div>
 <?php endif; ?>
 
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
 function showTab(t) {
   document.querySelectorAll('[id^="tab-"]').forEach(e=>e.style.display='none');
@@ -512,6 +584,224 @@ if(p.get('tab')) {
   document.getElementById('tab-'+p.get('tab')).style.display='block';
   document.getElementById('tab-mobil').style.display='none';
 }
+
+// --- Charts (near realtime via polling JSON) ---
+let chartPendapatan = null;
+let chartDenda = null;
+let chartStatus = null;
+let lastPayload = null;
+
+function applyCharts(payload) {
+  if(!payload || !payload.labels) return;
+
+  const labels = payload.labels;
+
+  const formatIDR = (val) => {
+    const num = Number(val || 0);
+    return 'Rp ' + num.toLocaleString('id-ID');
+  };
+  const formatCompact = (val) => {
+    const num = Number(val || 0);
+    if (num >= 1e9) return (num/1e9).toFixed(1).replace(/\.0$/, '') + 'B';
+    if (num >= 1e6) return (num/1e6).toFixed(1).replace(/\.0$/, '') + 'Jt';
+    if (num >= 1e3) return (num/1e3).toFixed(1).replace(/\.0$/, '') + 'Rb';
+    return num.toLocaleString('id-ID');
+  };
+
+  // Pendapatan
+  if(!chartPendapatan) {
+    const ctx = document.getElementById('chartPendapatan');
+    chartPendapatan = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [{
+          label: 'Pendapatan',
+          data: payload.pendapatan,
+          borderColor: '#e8c547',
+          backgroundColor: 'rgba(232,197,71,.15)',
+          pointBackgroundColor: '#e8c547',
+          pointBorderColor: '#0e0e18',
+          pointRadius: 3,
+          pointHoverRadius: 5,
+          tension: 0.25,
+          fill: true
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { labels: { color: '#f0ede8' } },
+          tooltip: {
+            callbacks: {
+              label: (ctx) => `${ctx.dataset.label}: ${formatIDR(ctx.parsed.y)}`
+            }
+          }
+        },
+        scales: {
+          x: {
+            ticks: { color: '#5a5a6e' },
+            grid: { color: 'rgba(90,90,110,.12)' }
+          },
+          y: {
+            beginAtZero: true,
+            ticks: {
+              color: '#5a5a6e',
+              callback: (v) => formatCompact(v)
+            },
+            grid: { color: 'rgba(90,90,110,.12)' }
+          }
+        }
+      }
+    });
+  } else {
+    chartPendapatan.data.labels = labels;
+    chartPendapatan.data.datasets[0].data = payload.pendapatan;
+    chartPendapatan.update();
+  }
+
+  // Denda
+  if(!chartDenda) {
+    const ctx = document.getElementById('chartDenda');
+    chartDenda = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels,
+        datasets: [{
+          label: 'Denda',
+          data: payload.denda,
+          backgroundColor: 'rgba(248,113,113,.35)',
+          borderColor: '#f87171',
+          borderWidth: 1,
+          borderRadius: 6,
+          hoverBackgroundColor: 'rgba(248,113,113,.55)'
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { labels: { color: '#f0ede8' } },
+          tooltip: {
+            callbacks: {
+              label: (ctx) => `${ctx.dataset.label}: ${formatIDR(ctx.parsed.y)}`
+            }
+          }
+        },
+        scales: {
+          x: {
+            ticks: { color: '#5a5a6e' },
+            grid: { color: 'rgba(90,90,110,.12)' }
+          },
+          y: {
+            beginAtZero: true,
+            ticks: {
+              color: '#5a5a6e',
+              callback: (v) => formatCompact(v)
+            },
+            grid: { color: 'rgba(90,90,110,.12)' }
+          }
+        }
+      }
+    });
+  } else {
+    chartDenda.data.labels = labels;
+    chartDenda.data.datasets[0].data = payload.denda;
+    chartDenda.update();
+  }
+
+  // Status
+  const statusKeys = payload.statusKeys || [];
+  if(!chartStatus) {
+    const ctx = document.getElementById('chartStatus');
+    const datasets = statusKeys.map(k => ({
+      label: k,
+      data: payload.series?.[k] ?? [],
+      borderColor: payload.statusWarna?.[k] ?? '#60a5fa',
+      backgroundColor: 'rgba(96,165,250,.15)',
+      pointBackgroundColor: payload.statusWarna?.[k] ?? '#60a5fa',
+      pointRadius: 2,
+      pointHoverRadius: 4,
+      tension: 0.2,
+      fill: false
+    }));
+    chartStatus = new Chart(ctx, {
+      type: 'line',
+      data: { labels, datasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: {
+            labels: {
+              color: '#f0ede8'
+            }
+          },
+          tooltip: {
+            mode: 'index',
+            intersect: false,
+            callbacks: {
+              label: (ctx) => `${ctx.dataset.label}: ${ctx.parsed.y ?? 0} transaksi`
+            }
+          }
+        },
+        scales: {
+          x: {
+            ticks: { color: '#5a5a6e' },
+            grid: { color: 'rgba(90,90,110,.12)' }
+          },
+          y: {
+            ticks: { color: '#5a5a6e' },
+            beginAtZero: true,
+            grid: { color: 'rgba(90,90,110,.12)' }
+          }
+        }
+      }
+    });
+  } else {
+    chartStatus.data.labels = labels;
+    // rebuild datasets but keep chart type/options simple
+    chartStatus.data.datasets = statusKeys.map(k => ({
+      label: k,
+      data: payload.series?.[k] ?? [],
+      borderColor: payload.statusWarna?.[k] ?? '#60a5fa',
+      backgroundColor: 'rgba(96,165,250,.15)',
+      pointBackgroundColor: payload.statusWarna?.[k] ?? '#60a5fa',
+      pointRadius: 2,
+      pointHoverRadius: 4,
+      tension: 0.2,
+      fill: false
+    }));
+    chartStatus.update();
+  }
+}
+
+async function refreshCharts() {
+  try {
+    const res = await fetch('admin_dashboard_data.php', { cache: 'no-store' });
+    if(!res.ok) return;
+    const payload = await res.json();
+
+    // simple guard: avoid re-applying identical payload too often
+    const sig = JSON.stringify(payload);
+    if(lastPayload && lastPayload.sig === sig) return;
+
+    lastPayload = { sig: sig };
+    applyCharts(payload);
+  } catch(e) {
+    // ignore
+  }
+}
+
+// Initial load when page ready
+refreshCharts();
+// Poll every 8 seconds (near realtime)
+setInterval(refreshCharts, 8000);
 </script>
+
 </body>
 </html>
